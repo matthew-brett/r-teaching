@@ -1,0 +1,238 @@
+---
+title: "Processing a WHO air quality data file"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+Load the [Excel spreadsheet](https://www.who.int/phe/health_topics/outdoorair/databases/who-aap-database-may2016.xlsx) from the [WHO Global Urban Ambient Air Pollution Database](https://www.who.int/phe/health_topics/outdoorair/databases/cities/en)
+
+```{r}
+# Load the packages for reading Excel files
+# Use the Bristol R package mirror
+bristol_cran <- 'https://www.stats.bris.ac.uk/R'
+install.packages('rJava', repo=bristol_cran)
+install.packages("XLConnect", repo=bristol_cran)
+library(XLConnect)
+```
+
+Load the relevant worksheet from the Excel file:
+
+```{r}
+workbook <- loadWorkbook('aap_air_quality_database_2018_v14.xlsx')
+data <- XLConnect::readWorksheet(workbook, 'database', startRow=3)
+head(data)
+```
+
+```{r}
+str(data)
+```
+
+We are going to use some [Tidyverse](https://www.tidyverse.org) packages to organize the data.
+
+```{r}
+install.packages("tidyverse", repo=bristol_cran)
+```
+
+`dplyr` is part of the Tidyverse.  It has some nice utilities for selecting and renaming columns in a data frame.  You can so this without `dplyr`, but `dplyr` makes it much easier to express in a few lines of code.
+
+```{r}
+library(dplyr)
+```
+
+Notice there are two sets of columns starting `Annual.mean`.
+
+```{r}
+str(select(data, starts_with('Annual.mean')))
+```
+
+Likewise for `Temporal.coverage`:
+
+```{r}
+str(select(data, starts_with('Temporal.coverage')))
+```
+
+Looking at the column names, and at the original Excel file, the first in each pair refers to PM10, and the second to PM2.5 : https://en.wikipedia.org/wiki/Particulates
+
+We rename the columns accordingly:
+
+```{r}
+data <- rename(data,
+               'pm10_yr_mean'='Annual.mean..ug.m3',
+               'pm10_temp_cover'='Temporal.coverage',
+               'pm25_yr_mean'='Annual.mean..ug.m3.1',
+               'pm25_temp_cover'='Temporal.coverage.1'
+)
+head(data)
+```
+
+Looking through the data (perhaps with the `View` function), it looks like the particulate concentration columns have form `(<number>)-converted value` if the value is converted.
+
+```{r}
+head(data$pm25_yr_mean)
+```
+
+First we check that the `note.on.converted.PM25` column always says `Converted` when the PM2.5 concentration column has `-converted value`:
+
+```{r}
+is_converted <- data$note.on.converted.PM2.5 == 'Converted'
+head(is_converted)
+```
+
+Do all the `Converted` values have `-converted value` in their concentration column?  Do `Measured` values never have `-converted value` in their concentration column?
+
+Here we use the `stringr` package to make it easier to work with strings.  `stringr` is one of the packages in the Tidyverse.
+
+```{r}
+library(stringr)
+```
+
+For each value in the concentration column, we test whether it contains the string `-converted value`.
+
+```{r}
+has_converted_value = str_detect(data$pm25_yr_mean, '-converted value')
+head(has_converted_value)
+```
+
+We confirm that there is complete equivalence between the `Converted` values in the `note.on.converted.PM2.5` column, and the presence of `-converted value` in the concentration column.
+
+```{r}
+all(is_converted == has_converted_value)
+```
+
+Do the same for the PM10 columns:
+
+```{r}
+is_conv_pm10 <- data$note.on.converted.PM10 == 'Converted'
+all(is_conv_pm10 == str_detect(data$pm10_yr_mean, '-converted value'))
+```
+
+The equivalence we found means that we can throw away the `converted value` part of the concentration values, because the information is already in the matching `note.on.converted.PM` column.
+
+Now we need to convert the concentration column into numbers, by removing the `-converted value` part, and converting to numeric values.  Because we will do this for two columns, we put the logic into a function, so we can repeat it, without retyping.
+
+```{r}
+recode_col <- function(col) {
+  # Recode column with "converted" values as numeric
+  # Get number out of '(number)-converted value', if present
+  conv_strs <- str_match(col, '\\((\\d+)\\)-converted value')[, 2]
+  # If value did not match '(number)-converted value', we get NA
+  not_converted = is.na(conv_strs)
+  conv_values <- numeric(length(col))
+  conv_values[not_converted] = as.numeric(col[not_converted])
+  converted = !not_converted
+  conv_values[converted] = as.numeric(conv_strs[converted])
+  conv_values
+}
+```
+
+Apply the function to the two concentration columns:
+
+```{r}
+data$pm10_yr_mean = recode_col(data$pm10_yr_mean)
+data$pm25_yr_mean = recode_col(data$pm25_yr_mean)
+head(data)
+```
+
+Actually, there are a few typos in the `notes.on.converted.PM` fields:
+
+```{r}
+table(data$note.on.converted.PM2.5)
+```
+
+```{r}
+table(data$note.on.converted.PM10)
+```
+
+We need to set `measured` to be `Measured` and `converted` to be `Converted`.  To do this, we use the `str_to_title` function from the `stringr` library that we have already loaded:
+
+It works like this:
+
+```{r}
+str_to_title('measured')
+```
+
+We apply it to the whole vector, for both columns:
+
+```{r}
+data$note.on.converted.PM2.5 <- str_to_title(data$note.on.converted.PM2.5)
+table(data$note.on.converted.PM2.5)
+data$note.on.converted.PM10 <- str_to_title(data$note.on.converted.PM10)
+table(data$note.on.converted.PM10)
+```
+
+Next we process the `Region` field.  It consists of two pieces of information: the region name, and the income label, that can be `HIC` (High Income Country) or `LMIC` (Lower Middle Income Country):
+
+```{r}
+region_values <- data$Region
+head(region_values)
+```
+
+Time for some more fancy string manipulation:
+
+```{r}
+# Split the string into the region name and the income catagory.
+regions_types <- str_match(region_values, '(.*)\\s+\\((.*)\\)')
+head(regions_types)
+```
+
+Replace original `Region` column with region name, and add new `income_category` column:
+
+```{r}
+data$Region <- regions_types[, 2]
+data$income_category <- regions_types[, 3]
+head(data)
+```
+
+Confirm the number of income categories:
+
+```{r}
+table(data$income_category)
+```
+
+For convenience, we would like `income_category` to come after `Region` in the sequence of columns.
+
+```{r}
+col_names <- names(data)
+col_names
+```
+
+```{r}
+# Reorder, to put income category after Region
+new_names = c(col_names[1], 'income_category', col_names[2:15])
+new_names
+```
+
+Reorder data frame with new column order.
+
+```{r}
+data <- select(data, new_names)
+str(data)
+```
+
+We need a column for unique city / town name.  For example, there is more than one `London`, meaning the `City.Town` values are not unique to a city or town:
+
+```{r}
+town_is_london <- data$City.Town == 'London'
+subset(data, town_is_london)
+```
+
+Put the country name into the `City.Town` name, to disambiguate.
+
+```{r}
+data$City.Town <- paste(data$City.Town, ' (', data$Country, ')', sep='')
+head(subset(data, town_is_london))
+```
+
+Write the converted data frame to a CSV file.
+
+```{r}
+write.csv(data, 'aap_air_quality_database_2018_v14.csv', row.names=FALSE)
+```
+
+Check we can load the CSV file back into memory.
+
+```{r}
+csv_data <- read.csv('aap_air_quality_database_2018_v14.csv')
+head(csv_data)
+```
